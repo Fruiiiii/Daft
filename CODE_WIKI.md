@@ -431,6 +431,41 @@ df = (
 | `image_file_metadata` | `(file_expr)` | 从 ImageFile 提取 Struct：`width`(uint32)/`height`(uint32)/`format`(str)/`mode`(str) |
 | `decode_image_file` | `(file_expr, mode=None, on_error="raise")` | `mode`：目标模式，`None` 自动推断；`on_error`：同 `decode_image` |
 
+#### Expression 链式调用形式
+
+图像算子除了顶层函数形式（`daft.functions.resize(image, w, h)`）外，还提供 Expression 链式方法形式（`df["image"].resize(w, h)`）。链式方法定义于 [daft/expressions/expressions.py](file:///workspace/daft/expressions/expressions.py)，是同名函数的薄封装，适合管道式书写：
+
+```python
+import daft
+from daft.functions import decode_image
+
+df = (
+    daft.from_glob_path("s3://bucket/images/*")
+    .with_column("image_bytes", daft.col("path").download())
+    .with_column("image", decode_image(daft.col("image_bytes")))
+)
+
+# 链式调用：同一行的多个算子按顺序作用于上一列结果
+df = (
+    df.with_column("rgb", daft.col("image").convert_image("RGB"))     # = convert_image(image, "RGB")
+      .with_column("small", daft.col("rgb").resize(288, 288))         # = resize(rgb, 288, 288)
+      .with_column("logo", daft.col("rgb").crop((0, 0, 100, 100)))    # = crop(rgb, (0, 0, 100, 100))
+      .with_column("png", daft.col("small").encode_image("png"))      # = encode_image(small, "png")
+      .with_column("tensor", daft.col("small").to_tensor())           # = image_to_tensor(small)
+)
+```
+
+两种形式的对应关系（参数完全一致，详见上表）：
+
+| 顶层函数形式 | 链式方法形式 |
+| --- | --- |
+| `resize(image, w, h)` | `image.resize(w, h)`（[expressions.py:2437](file:///workspace/daft/expressions/expressions.py#L2437)） |
+| `crop(image, bbox)` | `image.crop(bbox)`（[expressions.py:2447](file:///workspace/daft/expressions/expressions.py#L2447)） |
+| `convert_image(image, mode)` | `image.convert_image(mode)`（[expressions.py:2764](file:///workspace/daft/expressions/expressions.py#L2764)） |
+| `encode_image(image, fmt)` | `image.encode_image(fmt)`（[expressions.py:2602](file:///workspace/daft/expressions/expressions.py#L2602)） |
+| `image_to_tensor(image)` | `image.to_tensor()` |
+| `image_hash(image, ...)` | `image.image_hash(...)`（[expressions.py:2994](file:///workspace/daft/expressions/expressions.py#L2994)） |
+
 ### 6.2 多模态文件算子（File 类型体系）
 
 #### Rust 内核 — [src/daft-file/src/](file:///workspace/src/daft-file/src)
@@ -502,7 +537,47 @@ df = df.with_column("mime", guess_mime_type(df["data"]))
 | `file_exists` | `(file)` | 异步校验文件是否存在（Boolean） |
 | `guess_mime_type` | `(bytes_expr)` | 检查二进制魔数，识别 PNG/JPEG/GIF/WEBP/PDF/ZIP/MP3/WAV/OGG/MP4/MPEG/HDF5/HTML，返回 MIME 字符串（如 `"image/png"`）或 `None` |
 
-> 提示：`VideoFile`/`AudioFile`/`Hdf5File` 上还有实例方法（`frames()`、`metadata()`、`resample()`、`keys()`、`attrs()` 等），由下文各模态表达式函数在内部调用。
+#### File 实例方法（单文件 Python 调用）
+
+File 对象除了在 DataFrame 中作为表达式列使用外，也可以在 Python 中直接创建并调用实例方法——适合单文件调试与 UDF 内部使用。实现位于 [daft/file/](file:///workspace/daft/file)（下文各模态表达式函数在内部正是调用这些方法）：
+
+```python
+from daft.file import video_file, audio_file, image_file, hdf5_file
+
+# 视频文件（daft/file/video.py）
+vf = video_file("s3://bucket/videos/zoo.mp4")
+vf.metadata(buffer_size=65536)      # → VideoMetadata：width/height/fps/frame_count/time_base/keyframe_pts/keyframe_indices
+vf.keyframes(start_time=0)          # → 惰性迭代器，产出 PIL.Image
+vf.frames(start_time=0, end_time=10, width=640, height=480,
+          is_key_frame=True)        # → 帧字典迭代器（含 data 键）
+
+# 音频文件（daft/file/audio.py）
+af = audio_file("s3://bucket/audio/clip.mp3")
+af.metadata()                       # → AudioMetadata：sample_rate/channels/frames/format/subtype
+af.resample(16000)                  # → np.ndarray[float64] 波形
+
+# 图像文件（daft/file/image.py）
+imf = image_file("s3://bucket/images/a.png")
+imf.metadata()                      # → ImageMetadata：width/height/format/mode（惰性，只读文件头）
+imf.decode(mode="RGB")              # → PIL.Image.Image
+
+# HDF5 文件（daft/file/hdf5.py）
+hf = hdf5_file("s3://bucket/data/experiment.h5")
+hf.keys(group="/")                  # → list[str]，对齐 h5py Group.keys()
+hf.metadata(group="/")              # → list[Hdf5ObjectMetadata]（递归遍历组/数据集）
+hf.attrs(h5path="/run1")            # → dict[str, Any] 属性字典
+```
+
+| 实例方法 | 签名 | 参数说明 |
+| --- | --- | --- |
+| `VideoFile.metadata` | `(buffer_size=BUFFER_METADATA)` | `buffer_size`：读取容器头的缓冲字节数；返回 [VideoMetadata](file:///workspace/daft/file/video.py#L45)，比表达式函数多暴露 `keyframe_pts`/`keyframe_indices` |
+| `VideoFile.keyframes` | `(start_time=0, end_time=None)` | 时间范围（秒）；返回惰性 `Iterator[PIL.Image]`（[video.py:105](file:///workspace/daft/file/video.py#L105)） |
+| `VideoFile.frames` | `(start_time=0, end_time=None, width=None, height=None, is_key_frame=None, sample_interval_seconds=None, buffer_size=BUFFER_COPY)` | 参数语义与 `video_frames` 表达式函数一致（[video.py:110](file:///workspace/daft/file/video.py#L110)）；产出帧字典迭代器 |
+| `AudioFile.metadata` | `()` | 无参数；返回 AudioMetadata Struct（[audio.py:36](file:///workspace/daft/file/audio.py#L36)） |
+| `AudioFile.resample` | `(sample_rate, buffer_size=BUFFER_COPY)` | `sample_rate`：目标采样率；`buffer_size`：临时文件缓冲；返回 `np.ndarray[float64]`（[audio.py:70](file:///workspace/daft/file/audio.py#L70)） |
+| `ImageFile.metadata` | `()` | 无参数；利用 PIL 惰性打开，仅读文件头不解码像素（[image.py:38](file:///workspace/daft/file/image.py#L38)） |
+| `ImageFile.decode` | `(mode=None, buffer_size=BUFFER_COPY)` | `mode`：目标色彩模式（如 `"RGB"`），`None` 保持原样；返回 PIL Image（[image.py:56](file:///workspace/daft/file/image.py#L56)） |
+| `Hdf5File.keys` / `Hdf5File.metadata` / `Hdf5File.attrs` | `(group="/")` / `(group="/")` / `(h5path="/")` | 参数语义与 `hdf5_keys`/`hdf5_metadata`/`hdf5_attrs` 表达式函数一致（[hdf5.py:121/70/138](file:///workspace/daft/file/hdf5.py#L121)） |
 
 ### 6.3 视频算子
 
