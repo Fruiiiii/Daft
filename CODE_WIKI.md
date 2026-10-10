@@ -384,6 +384,53 @@ Daft 的多模态算子横跨 **Rust 内核实现** 与 **Python 函数封装** 
 | [daft/functions/image.py](file:///workspace/daft/functions/image.py) | `resize`、`crop`、`encode_image`、`decode_image`、`convert_image`、`image_to_tensor`、`image_attribute`、`image_width`、`image_height`、`image_channel`、`image_mode`、`image_hash` |
 | [daft/functions/image_file_.py](file:///workspace/daft/functions/image_file_.py) | `image_file_metadata`、`decode_image_file` |
 
+#### 调用示例
+
+```python
+import daft
+from daft.functions import decode_image, encode_image, image_hash, decode_image_file
+
+# 1) 全局管道：发现文件 → 下载字节 → 解码 → 预处理 → 哈希
+df = daft.from_glob_path("hf://datasets/datasets-examples/doc-image-3/images")
+df = (
+    df.with_column("image_bytes", daft.col("path").download())
+      # 字节 → Image 类型（出错时返回 null 而不是中断）
+      .with_column("image", decode_image(daft.col("image_bytes"), on_error="null"))
+      # 色彩模式转换（链式方法等价于 convert_image / resize）
+      .with_column("image_resized", daft.col("image").convert_image("RGB").resize(288, 288))
+      # 感知哈希，用于近重复检测（返回 FixedSizeBinary）
+      .with_column("hash", image_hash(daft.col("image_resized"), method="phash"))
+)
+
+# 2) 编码回字节（PNG/JPEG），可写回对象存储
+df = df.with_column("png_bytes", encode_image(daft.col("image_resized"), "png"))
+
+# 3) 基于 ImageFile 的惰性解码与元数据
+from daft.functions import image_file, image_file_metadata
+
+df = (
+    daft.from_glob_path("s3://bucket/images/*")
+    .with_column("file", image_file(daft.col("path")))
+    .with_column("meta", image_file_metadata(daft.col("file")))   # width/height/format/mode
+    .with_column("image", decode_image_file(daft.col("file"), mode="RGB"))
+)
+```
+
+#### 参数说明
+
+| 函数 | 签名 | 参数说明 |
+| --- | --- | --- |
+| `decode_image` | `(bytes, on_error="raise", mode=ImageMode.RGB)` | `bytes`：二进制表达式（PNG/JPEG 等编码字节）；`on_error`：解码失败时 `"raise"` 抛错 / `"null"` 记 null；`mode`：解码前转换的色彩模式（如 `"RGB"`），`None` 表示按数据自动推断 |
+| `encode_image` | `(image, image_format)` | `image_format`：输出格式（`str` 或 `ImageFormat`，如 `"png"`、`"jpeg"`），返回 Binary 列 |
+| `resize` | `(image, w, h)` | `w` / `h`：目标宽度 / 高度（像素，int） |
+| `crop` | `(image, bbox)` | `bbox`：`(x, y, width, height)` 四元组，或「每行一个四元素列表」的 List 表达式（按行动态裁剪） |
+| `convert_image` | `(image, mode)` | `mode`：目标色彩模式（`str` 或 `ImageMode`，如 `"RGB"`、`"RGBA"`、`"L"`） |
+| `image_to_tensor` | `(image)` | 自动推断像素 dtype 与 shape，转为 Tensor 类型（比手动 cast 更安全） |
+| `image_width` / `image_height` / `image_channel` / `image_mode` | `(image)` | 无额外参数，返回 UInt32 属性表达式 |
+| `image_hash` | `(image, *, method="phash", hash_size=8, binbits=3, segments=3)` | `method`：哈希算法，可选 `"phash"`（默认、最稳健）/ `"phash_simple"` / `"dhash"` / `"dhash_vertical"` / `"ahash"`（最快）/ `"whash"`（`hash_size` 须为 2 的幂）/ `"crop_resistant"`（抗裁剪）/ `"colorhash"`；`hash_size`：空间哈希网格尺寸（输出 `hash_size²` 位，常用 8/16，`colorhash` 忽略）；`binbits`：仅 `colorhash` 生效，输出 `14×binbits` 位；`segments`：仅 `crop_resistant` 生效，图像切分为 `segments×segments` 网格分别哈希 |
+| `image_file_metadata` | `(file_expr)` | 从 ImageFile 提取 Struct：`width`(uint32)/`height`(uint32)/`format`(str)/`mode`(str) |
+| `decode_image_file` | `(file_expr, mode=None, on_error="raise")` | `mode`：目标模式，`None` 自动推断；`on_error`：同 `decode_image` |
+
 ### 6.2 多模态文件算子（File 类型体系）
 
 #### Rust 内核 — [src/daft-file/src/](file:///workspace/src/daft-file/src)
@@ -418,6 +465,45 @@ Daft 的多模态算子横跨 **Rust 内核实现** 与 **Python 函数封装** 
 
 导出 `file`、`file_path`、`file_size`、`file_exists`、`video_file`、`audio_file`、`image_file`、`hdf5_file`、`guess_mime_type`。
 
+#### 调用示例
+
+```python
+import daft
+from daft.functions import (
+    file, video_file, image_file, hdf5_file,
+    file_path, file_size, file_exists, guess_mime_type,
+)
+
+# 1) URL → 模态化 File 引用（惰性，不下载内容）
+df = daft.from_glob_path("s3://bucket/media/*")
+df = df.with_column("vfile", video_file(daft.col("path"), verify=True))
+
+# 2) File 列的通用属性
+df = (
+    df.with_column("path2", file_path(daft.col("vfile")))
+      .with_column("size", file_size(daft.col("vfile")))      # UInt64 字节
+      .with_column("exists", file_exists(daft.col("vfile")))  # 布尔（异步算子）
+)
+
+# 3) 按魔数猜测 MIME 类型（无需解码，无法识别时返回 None）
+df = daft.from_pydict({"data": [b"\x89PNG\r\n\x1a\n", b"not a known format"]})
+df = df.with_column("mime", guess_mime_type(df["data"]))
+# → "image/png" / None
+```
+
+#### 参数说明
+
+| 函数 | 签名 | 参数说明 |
+| --- | --- | --- |
+| `file` | `(url, io_config=None)` | 通用文件引用；`io_config`：可选 IO 配置（S3 凭证、超时等） |
+| `video_file` / `audio_file` / `image_file` / `hdf5_file` | `(url, verify=False, io_config=None)` | 将 URL 列转为对应模态的 File 表达式；`verify=True` 时校验文件存在且属于该模态，任一不符即报错 |
+| `file_path` | `(file)` | 返回文件 URL 字符串（String） |
+| `file_size` | `(file)` | 返回文件字节数（UInt64） |
+| `file_exists` | `(file)` | 异步校验文件是否存在（Boolean） |
+| `guess_mime_type` | `(bytes_expr)` | 检查二进制魔数，识别 PNG/JPEG/GIF/WEBP/PDF/ZIP/MP3/WAV/OGG/MP4/MPEG/HDF5/HTML，返回 MIME 字符串（如 `"image/png"`）或 `None` |
+
+> 提示：`VideoFile`/`AudioFile`/`Hdf5File` 上还有实例方法（`frames()`、`metadata()`、`resample()`、`keys()`、`attrs()` 等），由下文各模态表达式函数在内部调用。
+
 ### 6.3 视频算子
 
 #### Python 封装 — [daft/functions/video.py](file:///workspace/daft/functions/video.py)
@@ -431,17 +517,119 @@ Daft 的多模态算子横跨 **Rust 内核实现** 与 **Python 函数封装** 
 | [daft/io/av/_read_video_frames.py](file:///workspace/daft/io/av/_read_video_frames.py) | 实现 `daft.read_video_frames`，作为 IO 数据源直接将视频帧读入 DataFrame（区别于 `video_frames` 表达式函数） |
 | [daft/io/av/__init__.py](file:///workspace/daft/io/av/__init__.py) | 模块导出 |
 
+#### 调用示例
+
+```python
+import daft
+from daft.functions import (
+    video_file, video_metadata, video_keyframes, video_frames, get_video_frame_by_idx,
+)
+
+# 1) 表达式方式：一行一个视频，帧解到 List 列中
+df = daft.from_glob_path("hf://datasets/Eventual-Inc/sample-files/videos/*.mp4")
+df = (
+    df.with_column("file", video_file(daft.col("path")))
+      # 元数据 Struct：width / height / fps / frame_count / time_base
+      .with_column("metadata", video_metadata(daft.col("file")))
+      # 关键帧（List[Image]），可限定时间范围（秒）
+      .with_column("keyframes", video_keyframes(daft.col("file"), start_time=0, end_time=10.0))
+      # 帧解码（List[Struct]），支持缩放、只取关键帧、按行动态时间范围
+      .with_column(
+          "frames",
+          video_frames(daft.col("file"), width=640, height=480, is_key_frame=True,
+                       start_time=daft.col("start"), end_time=daft.col("end")),
+      )
+      # 按索引取单帧（idx 支持 int 或整数表达式）
+      .with_column("first_frame", get_video_frame_by_idx(daft.col("file"), idx=0))
+)
+
+# 2) 数据源方式（daft.read_video_frames）：每帧展开为一行，流式读取
+df = daft.read_video_frames(
+    path="s3://daft-oss-public-data/videos/zoo.mp4",  # 支持 str / list / 通配符 / YouTube URL
+    image_height=480,
+    image_width=640,
+    is_key_frame=True,           # True 仅关键帧 / False 仅非关键帧 / None 全部
+    sample_interval_seconds=1.0, # 可选：约每 1 秒采样一帧
+)
+# 输出列：path, frame_index, frame_time, frame_time_base, frame_pts,
+#         frame_dts, frame_duration, is_key_frame, data(Image)
+```
+
+#### 参数说明
+
+| 函数 | 签名 | 参数说明 |
+| --- | --- | --- |
+| `video_metadata` | `(file_expr)` | 无额外参数；返回 Struct：`width`/`height`/`fps`/`frame_count`/`time_base` |
+| `video_keyframes` | `(file_expr, *, start_time=0, end_time=None)` | `start_time`/`end_time`：帧提取时间范围（秒，float）；返回 List[Image] |
+| `video_frames` | `(file_expr, *, start_time=0, end_time=None, width=None, height=None, is_key_frame=None, sample_interval_seconds=None)` | `start_time`/`end_time`：时间范围（秒），支持 `float` 或表达式（逐行动态）；`width`/`height`：目标缩放尺寸，必须成对提供；`is_key_frame`：`True` 仅关键帧 / `False` 仅非关键帧 / `None` 全部；`sample_interval_seconds`：按 `frame_time` 近似等间隔采样（选取时间戳 ≥ 目标时刻的第一帧），无有效时间戳的帧跳过。返回 List[Struct]，字段：`frame_index`/`frame_time`/`frame_time_base`/`frame_pts`/`frame_dts`/`frame_duration`/`is_key_frame`/`data` |
+| `get_video_frame_by_idx` | `(file_expr, idx)` | `idx`：帧索引（`int` 或整数表达式，逐行动态）；返回 Image |
+| `daft.read_video_frames` | `(path, image_height, image_width, is_key_frame=None, *, sample_interval_seconds=None, io_config=None)` | `path`：视频路径（`str`/`list[str]`，支持通配符与 YouTube URL，YouTube 需 `pip install yt-dlp`）；`image_height`/`image_width`：所有帧统一缩放到的尺寸（必填）；其余同 `video_frames`；需 PyAV（`pip install av`） |
+
 ### 6.4 音频算子
 
 #### Python 封装 — [daft/functions/audio.py](file:///workspace/daft/functions/audio.py)
 
 导出 `audio_metadata`（音频元数据提取）、`resample`（重采样）。
 
+#### 调用示例
+
+```python
+import daft
+from daft.functions import audio_file, audio_metadata, resample
+
+# 发现音频文件（返回含 path、size 列的 DataFrame）
+df = daft.from_glob_path("hf://datasets/Eventual-Inc/sample-files/audio/*.mp3")
+df = (
+    df.with_column("file", audio_file(daft.col("path")))
+      # 元数据 Struct：sample_rate / channels / frames / format / subtype
+      .with_column("metadata", audio_metadata(daft.col("file")))
+      # 重采样到 16kHz（Tensor[Float64] 波形）
+      .with_column("resampled", resample(daft.col("file"), sample_rate=16000))
+      .select("path", "size", "metadata", "resampled")
+)
+# 依赖：pip install 'daft[audio]'（soundfile + librosa）
+```
+
+#### 参数说明
+
+| 函数 | 签名 | 参数说明 |
+| --- | --- | --- |
+| `audio_metadata` | `(file_expr)` | 无额外参数；返回 Struct：`sample_rate`(int)/`channels`(int)/`frames`(float)/`format`(str)/`subtype`(str\|None)；需 `soundfile` |
+| `resample` | `(file_expr, sample_rate)` | `sample_rate`：目标采样率（int，如 16000）；返回 Tensor[Float64] 波形；需 `soundfile` + `librosa` |
+
 ### 6.5 HDF5 算子
 
 #### Python 封装 — [daft/functions/hdf5.py](file:///workspace/daft/functions/hdf5.py)
 
 导出 `hdf5_attrs`（属性读取）、`hdf5_keys`（键列举）、`hdf5_metadata`（元数据）。
+
+#### 调用示例
+
+```python
+import daft
+from daft.functions import hdf5_file, hdf5_attrs, hdf5_keys, hdf5_metadata
+
+df = daft.from_glob_path("s3://bucket/data/*.h5")
+df = (
+    df.with_column("file", hdf5_file(daft.col("path")))
+      # 根组（默认 "/"）下的直接成员名称 → List[String]
+      .with_column("keys", hdf5_keys(daft.col("file")))
+      # 指定组下的成员名称
+      .with_column("group_keys", hdf5_keys(daft.col("file"), group="/experiment"))
+      # 组/数据集元数据 → List[Struct]：h5path/kind/shape/dtype/chunks/compression
+      .with_column("meta", hdf5_metadata(daft.col("file")))
+      # 指定对象的属性 → Python dict
+      .with_column("attrs", hdf5_attrs(daft.col("file"), h5path="/experiment/dataset"))
+)
+```
+
+#### 参数说明
+
+| 函数 | 签名 | 参数说明 |
+| --- | --- | --- |
+| `hdf5_keys` | `(file_expr, group="/")` | `group`：HDF5 组路径，默认根组 `/`；返回该组下直接成员名称列表（List[String]），语义对齐 h5py `Group.keys()` |
+| `hdf5_metadata` | `(file_expr, group="/")` | `group`：HDF5 组路径，默认 `/`；返回该组下组与数据集的元数据列表（List[Struct]：`h5path`/`kind`/`shape`/`dtype`/`chunks`/`compression`） |
+| `hdf5_attrs` | `(file_expr, h5path="/")` | `h5path`：组或数据集路径，默认 `/`；返回「属性名 → 值」的 Python 字典（Python 类型） |
 
 ### 6.6 AI 算子（LLM / 嵌入 / 分类）
 
@@ -466,6 +654,83 @@ Daft 的多模态算子横跨 **Rust 内核实现** 与 **Python 函数封装** 
 #### Rust AI 内核 — [src/daft-ai/](file:///workspace/src/daft-ai)
 
 提供 AI provider 协议与表达式内核，通过 [src/lib.rs](file:///workspace/src/lib.rs) 的 `daft_ai::register_modules(m)` 注册到 Python。
+
+#### 调用示例
+
+```python
+import daft
+from daft.functions import decode_image, embed_text, embed_image, classify_text, classify_image
+from daft.functions.ai import prompt
+
+# 1) 文本嵌入 → Embedding[Float32; 384]
+df = daft.read_huggingface("togethercomputer/RedPajama-Data-1T")
+df = df.with_column(
+    "embeddings",
+    embed_text(daft.col("text"), provider="transformers",
+               model="sentence-transformers/all-MiniLM-L6-v2"),
+)
+
+# 2) 图像嵌入：解码 → 预处理 → 嵌入 → Embedding[Float32; 768]
+df = (
+    daft.from_glob_path("hf://datasets/datasets-examples/doc-image-3/images")
+    .with_column("image_bytes", daft.col("path").download())
+    .with_column("image_type", decode_image(daft.col("image_bytes")))
+    .with_column("image_resized", daft.col("image_type").convert_image("RGB").resize(288, 288))
+    .with_column(
+        "image_embeddings",
+        embed_image(daft.col("image_resized"), provider="transformers",
+                    model="apple/aimv2-large-patch14-224-lit"),
+    )
+)
+
+# 3) 零样本分类（返回最可能标签的字符串）
+df = daft.from_pydict({"text": ["Daft is wicked fast!"]})
+df = df.with_column(
+    "label",
+    classify_text(daft.col("text"), labels=["Positive", "Negative"],
+                  provider="transformers", model="tabularisai/multilingual-sentiment-analysis"),
+)
+df = df.with_column(
+    "image_label",
+    classify_image(daft.col("image_resized"),
+                   labels=["bulbasaur", "catapie", "voltorb", "electrode"],
+                   provider="transformers", model="openai/clip-vit-base-patch32"),
+)
+
+# 4) LLM 提问（需设置 OPENAI_API_KEY）
+df = daft.from_pydict({"quote": ["I am going to be the king of the pirates!"]})
+df = df.with_column(
+    "response",
+    prompt(daft.col("quote"),
+           system_message="Classify the anime from the quote and return the show, character name, and explanation.",
+           provider="openai", model="gpt-5-nano"),
+)
+
+# 5) 结构化输出：用 Pydantic 模型约束返回格式
+from pydantic import BaseModel, Field
+
+class Anime(BaseModel):
+    show: str = Field(description="The name of the anime show")
+    character: str = Field(description="The name of the character who says the quote")
+
+df = df.with_column(
+    "out",
+    prompt(daft.col("quote"), return_format=Anime, provider="openai", model="gpt-5-nano"),
+)
+```
+
+#### 参数说明
+
+| 函数 | 签名 | 参数说明 |
+| --- | --- | --- |
+| `embed_text` | `(text, *, provider=None, model=None, dimensions=None, **options)` | `text`：字符串列表达式；`provider`：后端名或 `Provider` 实例（默认 `"transformers"`）；`model`：嵌入模型名（默认用该 provider 的默认模型）；`dimensions`：输出向量维度（provider/模型支持时生效）；`**options`：`EmbedTextOptions` 等其余模型选项。返回 Embedding 列 |
+| `embed_image` | `(image, *, provider=None, model=None, **options)` | `image`：Image 列表达式；其余同 `embed_text`（无 `dimensions`） |
+| `classify_text` / `classify_image` | `(input, labels, *, provider=None, model=None, **options)` | `input`：文本/图像列表达式；`labels`：单个标签或标签列表（零样本分类候选）；`model`：默认用 `zero-shot-classification` 类模型；返回最可能标签字符串（String） |
+| `prompt` | `(messages, return_format=None, *, system_message=None, provider=None, model=None, **options)` | `messages`：单条消息表达式或消息列表；每条可为纯文本、图像数据（ndarray/bytes/File，按 MIME 检测）或文件（PDF/TXT/HTML/音视频等）；`return_format`：Pydantic `BaseModel`，指定后返回结构化输出（Struct 列）；`system_message`：系统提示词；`provider`：默认 `"openai"`（支持 OpenAI/Google/Transformers/vLLM 等）；`model`：模型名；`**options`：`PromptOptions`（如温度等） |
+
+**Provider 解析顺序**（`_resolve_provider`，[daft/functions/ai/__init__.py](file:///workspace/daft/functions/ai/__init__.py)）：显式传入 `Provider` 实例 → 在当前 `Session` 中按名查找 → `load_provider(name)` 直接加载 → 会话当前 provider → 各 API 的默认 provider（嵌入/分类为 `transformers`，prompt 为 `openai`）。
+
+**vLLM 特殊限制**：`provider="vllm"` 时 `prompt` 不支持 `return_format`、`system_message` 与多消息列表，走 Rust 侧前缀缓存内核（`Expression.vllm`）。
 
 ### 6.7 函数注册入口 — [src/lib.rs](file:///workspace/src/lib.rs)
 
