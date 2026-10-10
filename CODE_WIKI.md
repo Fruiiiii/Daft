@@ -11,9 +11,10 @@
 - [3. Rust 工作区模块（src/）](#3-rust-工作区模块src)
 - [4. Python 包模块（daft/）](#4-python-包模块daft)
 - [5. 关键类与函数说明](#5-关键类与函数说明)
-- [6. 依赖关系](#6-依赖关系)
-- [7. 项目运行方式](#7-项目运行方式)
-- [8. 测试体系](#8-测试体系)
+- [6. 多模态算子详解](#6-多模态算子详解)
+- [7. 依赖关系](#7-依赖关系)
+- [8. 项目运行方式](#8-项目运行方式)
+- [9. 测试体系](#9-测试体系)
 
 ---
 
@@ -351,9 +352,175 @@ Python 包 [daft/](file:///workspace/daft) 是用户直接交互的 API 层。�
 
 ---
 
-## 6. 依赖关系
+## 6. 多模态算子详解
 
-### 6.1 Rust 工作区依赖（[Cargo.toml](file:///workspace/Cargo.toml)）
+Daft 的多模态算子横跨 **Rust 内核实现** 与 **Python 函数封装** 两层。用户通过 `daft.functions.*` 调用的算子最终经由 [src/lib.rs](file:///workspace/src/lib.rs) 的 `FUNCTION_REGISTRY` 注册到 Rust 内核执行。下文按模态逐一说明详细位置。
+
+### 6.1 图像算子
+
+#### Rust 内核 — [src/daft-image/src/functions/](file:///workspace/src/daft-image/src/functions)
+
+图像处理内核实现，通过 [daft-image/src/lib.rs](file:///workspace/src/daft-image/src/lib.rs) 暴露并注册为 `ImageFunctions`：
+
+| 算子 | 源文件 |
+| --- | --- |
+| `decode`（图像字节 → Image 类型） | [decode.rs](file:///workspace/src/daft-image/src/functions/decode.rs) |
+| `encode`（Image 类型 → PNG/JPEG/... 字节） | [encode.rs](file:///workspace/src/daft-image/src/functions/encode.rs) |
+| `resize`（调整尺寸） | [resize.rs](file:///workspace/src/daft-image/src/functions/resize.rs) |
+| `crop`（裁剪） | [crop.rs](file:///workspace/src/daft-image/src/functions/crop.rs) |
+| `to_mode`（色彩模式转换，如 RGB↔RGBA） | [to_mode.rs](file:///workspace/src/daft-image/src/functions/to_mode.rs) |
+| `to_tensor`（Image → Tensor） | [to_tensor.rs](file:///workspace/src/daft-image/src/functions/to_tensor.rs) |
+| `image_hash`（感知哈希，用于近重复检测） | [image_hash.rs](file:///workspace/src/daft-image/src/functions/image_hash.rs) |
+| `attribute`（宽度/高度/通道/模式属性） | [attribute.rs](file:///workspace/src/daft-image/src/functions/attribute.rs) |
+| `decode_image_file`（从 ImageFile 解码帧） | [decode_image_file.rs](file:///workspace/src/daft-image/src/functions/decode_image_file.rs) |
+| `image_file_metadata`（ImageFile 元数据提取） | [image_file_metadata.rs](file:///workspace/src/daft-image/src/functions/image_file_metadata.rs) |
+
+其他相关内核文件：[ops.rs](file:///workspace/src/daft-image/src/ops.rs)（通用算子调度）、[series.rs](file:///workspace/src/daft-image/src/series.rs)（Image Series 实现）、[counting_writer.rs](file:///workspace/src/daft-image/src/counting_writer.rs)、[iters.rs](file:///workspace/src/daft-image/src/iters.rs)。
+
+#### Python 封装
+
+| 模块 | 导出函数 |
+| --- | --- |
+| [daft/functions/image.py](file:///workspace/daft/functions/image.py) | `resize`、`crop`、`encode_image`、`decode_image`、`convert_image`、`image_to_tensor`、`image_attribute`、`image_width`、`image_height`、`image_channel`、`image_mode`、`image_hash` |
+| [daft/functions/image_file_.py](file:///workspace/daft/functions/image_file_.py) | `image_file_metadata`、`decode_image_file` |
+
+### 6.2 多模态文件算子（File 类型体系）
+
+#### Rust 内核 — [src/daft-file/src/](file:///workspace/src/daft-file/src)
+
+`daft-file` crate 实现多模态文件类型的算子与 Python 绑定：
+
+| 文件 | 职责 |
+| --- | --- |
+| [functions.rs](file:///workspace/src/daft-file/src/functions.rs) | 注册 `File`、`FilePath`、`VideoFile`、`AudioFile`、`ImageFile`、`Hdf5File`、`GuessMimeType`、`FileExists`（异步）、`Size`（异步）等函数 |
+| [python.rs](file:///workspace/src/daft-file/src/python.rs) | Python 类型绑定 |
+| [file.rs](file:///workspace/src/daft-file/src/file.rs) | `File` 结构体实现（惰性文件引用、随机访问、read/visit） |
+| [meta.rs](file:///workspace/src/daft-file/src/meta.rs) | 文件元数据 |
+
+#### 数据类型核心 — [src/daft-core/src/file/](file:///workspace/src/daft-core/src/file)
+
+[mod.rs](file:///workspace/src/daft-core/src/file/mod.rs) 定义 `File`/`ImageFile`/`VideoFile`/`AudioFile`/`Hdf5File` 的原生数据类型与 Series/Array 实现。
+
+#### Python 文件类型抽象 — [daft/file/](file:///workspace/daft/file)
+
+`daft.File` 及其多模态子类，提供 file-like 惰性引用接口：
+
+| 模块 | 类 | 说明 |
+| --- | --- | --- |
+| [daft/file/file.py](file:///workspace/daft/file/file.py) | `File` | 基类：惰性文件引用、open/read/visit、随机访问 |
+| [daft/file/image.py](file:///workspace/daft/file/image.py) | `ImageFile` | 图像文件，支持元数据提取与按需解码 |
+| [daft/file/video.py](file:///workspace/daft/file/video.py) | `VideoFile` | 视频文件，支持元数据、关键帧、帧解码 |
+| [daft/file/audio.py](file:///workspace/daft/file/audio.py) | `AudioFile` | 音频文件，支持元数据提取 |
+| [daft/file/hdf5.py](file:///workspace/daft/file/hdf5.py) | `Hdf5File` | HDF5 文件，支持 attrs/keys/metadata |
+| [daft/file/__init__.py](file:///workspace/daft/file/__init__.py) | — | 导出 `File`、`VideoFile`、`AudioFile`、`ImageFile`、`Hdf5File`、`open_file` |
+
+#### Python 文件函数封装 — [daft/functions/file_.py](file:///workspace/daft/functions/file_.py)
+
+导出 `file`、`file_path`、`file_size`、`file_exists`、`video_file`、`audio_file`、`image_file`、`hdf5_file`、`guess_mime_type`。
+
+### 6.3 视频算子
+
+#### Python 封装 — [daft/functions/video.py](file:///workspace/daft/functions/video.py)
+
+导出 `video_metadata`、`video_keyframes`、`video_frames`（从 `VideoFile` 列解码帧）。
+
+#### 视频帧数据源 — [daft/io/av/](file:///workspace/daft/io/av)
+
+| 文件 | 职责 |
+| --- | --- |
+| [daft/io/av/_read_video_frames.py](file:///workspace/daft/io/av/_read_video_frames.py) | 实现 `daft.read_video_frames`，作为 IO 数据源直接将视频帧读入 DataFrame（区别于 `video_frames` 表达式函数） |
+| [daft/io/av/__init__.py](file:///workspace/daft/io/av/__init__.py) | 模块导出 |
+
+### 6.4 音频算子
+
+#### Python 封装 — [daft/functions/audio.py](file:///workspace/daft/functions/audio.py)
+
+导出 `audio_metadata`（音频元数据提取）、`resample`（重采样）。
+
+### 6.5 HDF5 算子
+
+#### Python 封装 — [daft/functions/hdf5.py](file:///workspace/daft/functions/hdf5.py)
+
+导出 `hdf5_attrs`（属性读取）、`hdf5_keys`（键列举）、`hdf5_metadata`（元数据）。
+
+### 6.6 AI 算子（LLM / 嵌入 / 分类）
+
+#### Python 封装 — [daft/functions/ai/](file:///workspace/daft/functions/ai)
+
+[daft/functions/ai/__init__.py](file:///workspace/daft/functions/ai/__init__.py) 导出 `prompt`（LLM 文本生成）、`embed_text`（文本嵌入）、`embed_image`（图像嵌入）、`classify_text`（零样本文本分类）、`classify_image`（零样本图像分类）。
+
+#### AI Provider 层 — [daft/ai/](file:///workspace/daft/ai)
+
+[daft/ai/provider.py](file:///workspace/daft/ai/provider.py) 定义 `Provider` 抽象与 `PROVIDERS` 注册表，按后端组织：
+
+| 后端 | 目录 | 支持协议 |
+| --- | --- | --- |
+| OpenAI | [daft/ai/openai/](file:///workspace/daft/ai/openai) | prompter、text_embedder |
+| Google | [daft/ai/google/](file:///workspace/daft/ai/google) | prompter |
+| Transformers | [daft/ai/transformers/](file:///workspace/daft/ai/transformers) | image_classifier、image_embedder、text_classifier、text_embedder、prompter |
+| vLLM | [daft/ai/vllm/](file:///workspace/daft/ai/vllm) | prompter |
+| LM Studio | [daft/ai/lm_studio/](file:///workspace/daft/ai/lm_studio) | text_embedder |
+
+公共协议定义于 [daft/ai/protocols.py](file:///workspace/daft/ai/protocols.py)，类型定义于 [daft/ai/typing.py](file:///workspace/daft/ai/typing.py)，表达式于 [daft/ai/_expressions.py](file:///workspace/daft/ai/_expressions.py)。
+
+#### Rust AI 内核 — [src/daft-ai/](file:///workspace/src/daft-ai)
+
+提供 AI provider 协议与表达式内核，通过 [src/lib.rs](file:///workspace/src/lib.rs) 的 `daft_ai::register_modules(m)` 注册到 Python。
+
+### 6.7 函数注册入口 — [src/lib.rs](file:///workspace/src/lib.rs)
+
+所有多模态函数在 PyModule 初始化时统一注册到 `daft_dsl::functions::FUNCTION_REGISTRY`：
+
+```rust
+// 图像函数
+functions_registry.register::<daft_image::functions::ImageFunctions>();
+// 文件函数（含多模态文件类型）
+functions_registry.add_fn(daft_file::File);
+functions_registry.add_fn(daft_file::FilePath);
+functions_registry.add_async_fn(daft_file::FileExists);
+functions_registry.add_async_fn(daft_file::Size);
+functions_registry.add_fn(daft_file::VideoFile);
+functions_registry.add_fn(daft_file::AudioFile);
+functions_registry.add_fn(daft_file::ImageFile);
+functions_registry.add_fn(daft_file::Hdf5File);
+functions_registry.add_fn(daft_file::GuessMimeType);
+```
+
+### 6.8 调用链总结
+
+```
+用户 API                          Python 封装              Rust 内核
+─────────────────────────────────────────────────────────────────────
+daft.functions.image.resize()  → daft/functions/image.py → daft-image::functions::ImageFunctions (resize.rs)
+daft.functions.video_frames() → daft/functions/video.py → daft-file::functions (VideoFile)
+daft.functions.audio_metadata()→ daft/functions/audio.py→ daft-file::functions (AudioFile)
+daft.functions.hdf5_attrs()   → daft/functions/hdf5.py → daft-file::functions (Hdf5File)
+daft.functions.file()          → daft/functions/file_.py→ daft-file::functions (File)
+daft.functions.ai.prompt()    → daft/functions/ai/     → daft-ai (provider 内核)
+daft.read_video_frames()       → daft/io/av/            → daft-scan (ScanOperator)
+daft.ImageFile / VideoFile... → daft/file/*.py          → daft-core::file (数据类型)
+```
+
+### 6.9 多模态文档参考
+
+用户侧多模态使用文档位于 [docs/modalities/](file:///workspace/docs/modalities)：
+
+| 文档 | 内容 |
+| --- | --- |
+| [overview.md](file:///workspace/docs/modalities/overview.md) | 多模态总览 |
+| [images.md](file:///workspace/docs/modalities/images.md) | 图像处理指南（下载/解码/哈希/嵌入/分类） |
+| [audio.md](file:///workspace/docs/modalities/audio.md) | 音频处理指南 |
+| [videos.md](file:///workspace/docs/modalities/videos.md) | 视频处理指南 |
+| [files.md](file:///workspace/docs/modalities/files.md) | File 数据类型与 URL 处理 |
+| [tensors.md](file:///workspace/docs/modalities/tensors.md) | 张量与 HDF5 |
+
+AI 函数文档位于 [docs/ai-functions/](file:///workspace/docs/ai-functions)：[overview.md](file:///workspace/docs/ai-functions/overview.md)、[embed.md](file:///workspace/docs/ai-functions/embed.md)、[classify.md](file:///workspace/docs/ai-functions/classify.md)、[prompt.md](file:///workspace/docs/ai-functions/prompt.md)。
+
+---
+
+## 7. 依赖关系
+
+### 7.1 Rust 工作区依赖（[Cargo.toml](file:///workspace/Cargo.toml)）
 
 **核心外部依赖**（在 `[workspace.dependencies]` 统一版本管理）：
 
@@ -391,7 +558,7 @@ daft-local-plan / daft-local-execution / daft-distributed
 daft (根 crate, cdylib, 汇总注册)
 ```
 
-### 6.2 Python 依赖（[pyproject.toml](file:///workspace/pyproject.toml)）
+### 7.2 Python 依赖（[pyproject.toml](file:///workspace/pyproject.toml)）
 
 **必需依赖**：
 
@@ -410,7 +577,7 @@ daft (根 crate, cdylib, 汇总注册)
 
 **文档依赖（docs）**：`mkdocs-material`、`mkdocstrings-python`、`mkdocs-jupyter` 等。
 
-### 6.3 构建工具
+### 7.3 构建工具
 
 - **构建后端**：`maturin`（`[build-system]`），启用 `python` feature 编译为 abi3 扩展模块
 - **包管理**：`uv`（`[tool.uv]`，required-version `~=0.12.0`），含 workspace（`daft_dashboard`）
@@ -420,9 +587,9 @@ daft (根 crate, cdylib, 汇总注册)
 
 ---
 
-## 7. 项目运行方式
+## 8. 项目运行方式
 
-### 7.1 环境准备
+### 8.1 环境准备
 
 > 详见 [AGENTS.md](file:///workspace/AGENTS.md) 与 [CONTRIBUTING.md](file:///workspace/CONTRIBUTING.md)
 
@@ -434,7 +601,7 @@ make .venv
 source .venv/bin/activate
 ```
 
-### 7.2 编译构建
+### 8.2 编译构建
 
 由于核心引擎是 Rust，修改 Rust 代码后需重新编译：
 
@@ -454,7 +621,7 @@ make build-whl-cross BUILD_WHL_TARGET=... BUILD_WHL_USE_ZIG=1
 
 构建产物为 `daft/daft.abi3.so`（原生扩展模块），由 Python 包 `daft.daft` 导入。
 
-### 7.3 安装
+### 8.3 安装
 
 ```bash
 # 从 PyPI 安装（终端用户）
@@ -467,7 +634,7 @@ pip install "daft[all]"
 make .venv && make build
 ```
 
-### 7.4 选择执行 Runner
+### 8.4 选择执行 Runner
 
 ```python
 import daft
@@ -483,7 +650,7 @@ daft.set_runner_ray(address="auto")
 
 首次调用 `get_or_create_runner()` 后，runner 在进程生命周期内锁定。
 
-### 7.5 运行示例
+### 8.5 运行示例
 
 ```python
 import daft
@@ -501,7 +668,7 @@ df.show()
 df.collect()
 ```
 
-### 7.6 代码质量与文档
+### 8.6 代码质量与文档
 
 ```bash
 make format       # 格式化 Python 与 Rust
@@ -513,7 +680,7 @@ make docs         # 构 mkdocs 文档
 make docs-serve   # 开发服务器预览文档
 ```
 
-### 7.7 清理
+### 8.7 清理
 
 ```bash
 make clean        # 删除 .venv、target、site、.so
@@ -521,9 +688,9 @@ make clean        # 删除 .venv、target、site、.so
 
 ---
 
-## 8. 测试体系
+## 9. 测试体系
 
-### 8.1 测试命令
+### 9.1 测试命令
 
 测试位于 [tests/](file:///workspace/tests) 目录，使用 `pytest`：
 
@@ -545,7 +712,7 @@ make doctests
 
 `make test` 默认通过 `pytest -n auto` 并行执行，并设置 `--hypothesis-seed`。
 
-### 8.2 测试目录结构
+### 9.2 测试目录结构
 
 [tests/](file:///workspace/tests) 按功能域组织：
 
@@ -570,7 +737,7 @@ make doctests
 | `checkpoint/` | 检查点配置 |
 | `cookbook/` | 用法样例测试 |
 
-### 8.3 测试配置
+### 9.3 测试配置
 
 [pyproject.toml](file:///workspace/pyproject.toml) 的 `[tool.pytest.ini_options]`：
 
@@ -578,7 +745,7 @@ make doctests
 - `testpaths = ["tests"]`
 - `minversion = "6.0"`
 
-### 8.4 PR 规范
+### 9.4 PR 规范
 
 - 标题：Conventional Commits 格式（由 `.github/workflows/pr-labeller.yml` 强制）
 - 描述：遵循 [.github/pull_request_template.md](file:///workspace/.github/pull_request_template.md)
